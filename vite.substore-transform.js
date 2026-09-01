@@ -6,6 +6,22 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export const SUB_STORE_PATH = path.join(__dirname, 'sub-store/backend');
 
+const IS_SURGE_DECLARATION_PATTERN = /\bconst[ \t]+isSurge[ \t]*=[ \t]*typeof[ \t]+\$httpClient[ \t]*!==[ \t]*(['"])undefined\1[ \t]*&&[ \t]*!isLoon(?:[ \t]*&&[ \t]*[^;\r\n]+)?[ \t]*;/g;
+const PATCHED_IS_SURGE_DECLARATION_PATTERN = /\bconst[ \t]+isSurge[ \t]*=[ \t]*true[ \t]*;/;
+const NANOID_NAMESPACE_IMPORT_MARKER = '__SUB_STORE_WORKERS_PATCH__NANOID_NAMESPACE_IMPORT__';
+const NANOID_NAMESPACE_BINDING = '__subStoreWorkersNanoidNamespace_b8f4e163__';
+const NANOID_NAMESPACE_IMPORT = `import * as ${NANOID_NAMESPACE_BINDING} from 'nanoid'; // ${NANOID_NAMESPACE_IMPORT_MARKER}`;
+const RUNTIME_BUILTIN_REPLACEMENTS = new Map([
+    ['fs', 'globalThis.__fs_shim__'],
+    ['path', 'globalThis.__path_shim__'],
+    ['stream/promises', 'globalThis.__stream_promises_shim__'],
+    ['child_process', '({ execFile: () => {} })'],
+    ['dgram', 'undefined'],
+    ['net', 'undefined'],
+    ['tls', 'undefined'],
+    ['node:worker_threads', 'undefined'],
+]);
+
 export function subStoreTransformPlugin() {
     let expressPatchApplied = 0;
     let expressFileSeen = false;
@@ -32,21 +48,18 @@ export function subStoreTransformPlugin() {
 
     const dangerousRequireNames = [
         'dotenv',
-        'fs',
-        'path',
         'undici',
         'fetch-socks',
         'express',
         'body-parser',
         'cron',
-        'child_process',
         'connect-history-api-fallback',
         'http-proxy-middleware',
         'mime-types',
         'ms',
         'nanoid',
         '@maxmind/geoip2-node',
-        'stream/promises',
+        ...RUNTIME_BUILTIN_REPLACEMENTS.keys(),
     ];
     const dangerousRequirePatterns = dangerousRequireNames.flatMap((name) => {
         const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\//g, '\\/');
@@ -61,6 +74,22 @@ export function subStoreTransformPlugin() {
             new RegExp(`eval\\s*\\(\\s*['\"\`]require\\s*\\(\\s*['\"\`]${escaped}['\"\`]\\s*\\)['\"\`]\\s*,?\\s*\\)`, 'g'),
             replacement,
         );
+    }
+
+    function replaceNanoidRequire(contents, id, pluginContext) {
+        const replaced = replaceEvalRequire(contents, 'nanoid', NANOID_NAMESPACE_BINDING);
+        if (replaced === contents) return contents;
+
+        const hasMarker = contents.includes(NANOID_NAMESPACE_IMPORT_MARKER);
+        if (contents.includes(NANOID_NAMESPACE_BINDING) && !hasMarker) {
+            pluginContext.error(`[sub-store-transform] ${id} nanoid 静态导入 binding 与上游源码冲突`);
+        }
+
+        const output = hasMarker ? replaced : `${NANOID_NAMESPACE_IMPORT}\n${replaced}`;
+        if (!output.includes(NANOID_NAMESPACE_IMPORT)) {
+            pluginContext.error(`[sub-store-transform] ${id} nanoid 静态导入补丁未正确应用`);
+        }
+        return output;
     }
 
     function assertNoDangerousRequireResidue(contents, id, pluginContext) {
@@ -118,12 +147,21 @@ export default function getParser() {
             contents = replaceEvalRequire(contents, 'http-proxy-middleware', '({ createProxyMiddleware: () => (req, res, next) => next() })');
             contents = replaceEvalRequire(contents, 'mime-types', '({ contentType: () => "text/plain" })');
             contents = replaceEvalRequire(contents, 'ms', 'globalThis.__ms_shim__');
-            contents = replaceEvalRequire(contents, 'nanoid', '({ nanoid: (size = 21) => crypto.randomUUID().replace(/-/g, "").slice(0, size) })');
+            contents = replaceNanoidRequire(contents, id, this);
             contents = replaceEvalRequire(contents, '@maxmind/geoip2-node', '({ Reader: { openBuffer: () => ({ country: () => null, asn: () => null }) } })');
             contents = replaceEvalRequire(contents, 'stream/promises', 'globalThis.__stream_promises_shim__');
 
+            if (id.includes('sub-store/backend/src/runtime/')) {
+                // Sub-Store 2.39+ loads builtins through guarded callbacks. Keep
+                // tryNodeBuiltin's platform check; raw Node transports stay unavailable.
+                contents = contents.replace(
+                    /(?<![\w$.'"`])\brequire\s*\(\s*(['"])([^'"\r\n]+)\1\s*\)/g,
+                    (match, _quote, name) => RUNTIME_BUILTIN_REPLACEMENTS.get(name) ?? match,
+                );
+            }
+
             contents = contents.replace(/const\s+isNode\s*=\s*eval\s*\(\s*`typeof\s+process\s*!==\s*"undefined"`\s*\)/g, 'const isNode = false');
-            contents = contents.replace(/const\s+isSurge\s*=\s*typeof\s+\$httpClient\s*!==\s*['"]undefined['"]\s*&&\s*!isLoon\s*;/g, 'const isSurge = true;');
+            contents = contents.replace(IS_SURGE_DECLARATION_PATTERN, 'const isSurge = true;');
 
             assertNoDangerousRequireResidue(contents, id, this);
 
@@ -238,8 +276,7 @@ function __emitDone__(requestId, response) {
                 if (needsIsNodePatch && !contents.includes('const isNode = false')) {
                     this.error('[sub-store-transform] open-api.js 环境检测补丁未生效：isNode 仍可能触发 eval()');
                 }
-                const needsIsSurgePatch = beforeOpenApi.includes('const isSurge = typeof $httpClient');
-                if (needsIsSurgePatch && !contents.includes('const isSurge = true;')) {
+                if (!PATCHED_IS_SURGE_DECLARATION_PATTERN.test(contents)) {
                     this.error('[sub-store-transform] open-api.js 环境检测补丁未生效：isSurge 未被固定为 true');
                 }
 
@@ -328,6 +365,7 @@ const tasks = {
     awaitCustomCache,
     noCache,
     preprocess,
+    options = {},
 ) {
     let $arguments = {};
     try {
@@ -350,12 +388,25 @@ const tasks = {
     }
 
     if (noCache || ($arguments && $arguments.noCache)) {
-        return await __download_impl__(rawUrl, ua, timeout, customProxy, skipCustomCache, awaitCustomCache, noCache, preprocess);
+        return await __download_impl__(rawUrl, ua, timeout, customProxy, skipCustomCache, awaitCustomCache, noCache, preprocess, options);
     }
 
     const context = globalThis.__substore_get_active_context__?.();
     const scope = context?.user?.id ?? context?.requestId ?? '';
-    const inflightKey = String(scope) + '::' + String(ua || '') + '::' + String(rawUrl) + '::' + (preprocess ? '1' : '0');
+    const inflightOptions = options && typeof options === 'object' ? options : {};
+    const inflightIdentity = [
+        String(ua || ''),
+        String(rawUrl),
+        String(timeout ?? ''),
+        String(customProxy ?? ''),
+        Boolean(skipCustomCache),
+        Boolean(awaitCustomCache),
+        Boolean(preprocess),
+        Boolean(inflightOptions.returnRaw),
+        Boolean(inflightOptions.noFlow),
+        String(inflightOptions['age-secret-key'] || inflightOptions.ageSecretKey || ''),
+    ];
+    const inflightKey = String(scope) + '::' + hex_md5(JSON.stringify(inflightIdentity));
     if (!globalThis.__sub_store_workers_inflight_tasks__) {
         globalThis.__sub_store_workers_inflight_tasks__ = new Map();
     }
@@ -364,7 +415,7 @@ const tasks = {
     }
     const p = (async () => {
         try {
-            return await __download_impl__(rawUrl, ua, timeout, customProxy, skipCustomCache, awaitCustomCache, noCache, preprocess);
+            return await __download_impl__(rawUrl, ua, timeout, customProxy, skipCustomCache, awaitCustomCache, noCache, preprocess, options);
         } finally {
             globalThis.__sub_store_workers_inflight_tasks__.delete(inflightKey);
         }
@@ -376,6 +427,11 @@ const tasks = {
                     patchedChunk = wrapper + '\n' + patchedChunk;
                     if (!patchedChunk.includes('export default async function download(')) {
                         this.error('[sub-store-transform] download.js 补丁自检失败：wrapper 未注入');
+                    }
+                    const optionsForwardingCall = '__download_impl__(rawUrl, ua, timeout, customProxy, skipCustomCache, awaitCustomCache, noCache, preprocess, options)';
+                    const optionsForwardingCount = patchedChunk.split(optionsForwardingCall).length - 1;
+                    if (optionsForwardingCount !== 2 || !patchedChunk.includes('JSON.stringify(inflightIdentity)')) {
+                        this.error('[sub-store-transform] download.js 补丁自检失败：options 未完整转发或未进入 inflight key');
                     }
                     downloadPatchApplied += 1;
                     contents = before + patchedChunk + after;
@@ -488,7 +544,8 @@ export default {
             return null;
         },
 
-        buildEnd() {
+        buildEnd(error) {
+            if (error) return;
             if (!subStoreFileSeen) return;
             for (const [name, seen] of requiredTargetFiles) {
                 if (!seen()) this.error(`[sub-store-transform] 必需补丁目标未进入构建图：${name}`);
